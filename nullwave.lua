@@ -140,10 +140,8 @@ local infiniteAmmoEnabled = false
 local autoReloadEnabled   = false
 local autoReloadThreshold = 10
 local lastReloadTime      = 0
-
--- Cached ammo path: how to find ammo on any tool
--- Format: {type = "value"|"attribute"|"hud", obj = ..., name = ...}
-local ammoPath = nil
+local lastHudAmmo         = nil
+local maxHudAmmo          = 30  -- default fallback
 
 -- =========================================================
 -- TROOPS
@@ -197,6 +195,21 @@ local function getMainUi()
     local pg = player:FindFirstChild("PlayerGui")
     if not pg then return nil end
     return pg:FindFirstChild("MainUi")
+end
+
+-- Read ammo from HUD (confirmed path)
+local function readHudAmmo()
+    local mainUi = getMainUi()
+    if not mainUi then return nil end
+    local hud = mainUi:FindFirstChild("Ui")
+    if not hud then return nil end
+    hud = hud:FindFirstChild("Hud")
+    if not hud then return nil end
+    local gunStats = hud:FindFirstChild("GunStatsFrame")
+    if not gunStats then return nil end
+    local ammoLabel = gunStats:FindFirstChild("AmmoLeftText")
+    if not ammoLabel or not ammoLabel:IsA("TextLabel") then return nil end
+    return tonumber(ammoLabel.Text) or nil
 end
 
 local function getCash()
@@ -509,99 +522,14 @@ local function findGreenUpgradeButton()
 end
 
 -- =========================================================
--- AMMO DETECTION — comprehensive
+-- RELOAD KEY
 -- =========================================================
-local AMMO_KEYWORDS = {"ammo", "clip", "mag", "round", "bullet", "shell", "charge", "reserve"}
-
-local function looksLikeAmmo(name)
-    if not name then return false end
-    local n = tostring(name):lower()
-    for _, kw in ipairs(AMMO_KEYWORDS) do
-        if n:find(kw, 1, true) then return true end
-    end
-    return false
-end
-
--- Scans a tool for ammo — returns {type, obj, name} or nil
-local function findAmmoOnTool(tool)
-    if not tool then return nil end
-
-    -- 1. ValueObject in descendants
-    for _, d in ipairs(tool:GetDescendants()) do
-        if d:IsA("IntValue") or d:IsA("NumberValue") then
-            if looksLikeAmmo(d.Name) then
-                return {type = "value", obj = d, name = d.Name}
-            end
-        end
-    end
-
-    -- 2. Attribute on tool itself
-    for _, attrName in ipairs(tool:GetAttributes()) do
-        if looksLikeAmmo(attrName) then
-            local v = tool:GetAttribute(attrName)
-            if type(v) == "number" then
-                return {type = "attribute", obj = tool, name = attrName}
-            end
-        end
-    end
-
-    -- 3. ValueObject in character (some games store ammo on char)
-    local char = player.Character
-    if char then
-        for _, d in ipairs(char:GetChildren()) do
-            if (d:IsA("IntValue") or d:IsA("NumberValue")) and looksLikeAmmo(d.Name) then
-                return {type = "value", obj = d, name = d.Name}
-            end
-        end
-    end
-
-    -- 4. Attribute on character
-    if char then
-        for _, attrName in ipairs(char:GetAttributes()) do
-            if looksLikeAmmo(attrName) then
-                local v = char:GetAttribute(attrName)
-                if type(v) == "number" then
-                    return {type = "attribute", obj = char, name = attrName}
-                end
-            end
-        end
-    end
-
-    return nil
-end
-
--- Read current ammo count based on cached path
-local function readAmmo()
-    if not ammoPath then return nil end
-    local obj = ammoPath.obj
-    if not obj or not obj.Parent then
-        ammoPath = nil
-        return nil
-    end
-    if ammoPath.type == "value" then
-        return tonumber(obj.Value) or 0
-    elseif ammoPath.type == "attribute" then
-        return tonumber(obj:GetAttribute(ammoPath.name)) or 0
-    end
-    return nil
-end
-
--- Write ammo count
-local function writeAmmo(val)
-    if not ammoPath then return false end
-    local obj = ammoPath.obj
-    if not obj or not obj.Parent then
-        ammoPath = nil
-        return false
-    end
-    if ammoPath.type == "value" then
-        pcall(function() obj.Value = val end)
-        return true
-    elseif ammoPath.type == "attribute" then
-        pcall(function() obj:SetAttribute(ammoPath.name, val) end)
-        return true
-    end
-    return false
+local function pressReload()
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.R, false, game)
+        task.wait(0.05)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.R, false, game)
+    end)
 end
 
 -- =========================================================
@@ -672,13 +600,13 @@ RunService.Stepped:Connect(function()
 end)
 
 -- =========================================================
--- INFINITE AMMO + AUTO RELOAD
+-- INFINITE AMMO + AUTO RELOAD (via HUD reading)
 -- =========================================================
 task.spawn(function()
     while not destroyed do
-        task.wait(0.1)
+        task.wait(0.05)
         if not infiniteAmmoEnabled and not autoReloadEnabled then
-            ammoPath = nil  -- reset cache when disabled
+            lastHudAmmo = nil
             continue
         end
 
@@ -686,55 +614,40 @@ task.spawn(function()
         if not char then continue end
         local tool = char:FindFirstChildWhichIsA("Tool")
         if not tool then
-            ammoPath = nil
+            lastHudAmmo = nil
             continue
         end
 
-        -- Refresh ammoPath if tool changed or cache invalid
-        if ammoPath and ammoPath.type == "value" and ammoPath.obj
-           and not ammoPath.obj:IsDescendantOf(tool) then
-            ammoPath = nil
-        end
-        if ammoPath and ammoPath.type == "attribute" and ammoPath.obj ~= tool then
-            ammoPath = nil
-        end
+        local ammo = readHudAmmo()
+        if ammo == nil then continue end
 
-        if not ammoPath then
-            ammoPath = findAmmoOnTool(tool)
+        -- Track max ammo
+        if ammo > maxHudAmmo then
+            maxHudAmmo = ammo
         end
 
-        if not ammoPath then continue end
-
-        local currentAmmo = readAmmo()
-        if currentAmmo == nil then continue end
-
-        -- Cache max ammo per tool
-        local maxKey = "NullWave_MaxAmmo"
-        local storedMax = tool:GetAttribute(maxKey)
-        if not storedMax or currentAmmo > storedMax then
-            tool:SetAttribute(maxKey, currentAmmo)
-            storedMax = currentAmmo
-        end
-
-        -- Infinite Ammo: keep ammo at max
+        -- INFINITE AMMO: press R every 0.3s unconditionally while shooting
         if infiniteAmmoEnabled then
-            if currentAmmo < storedMax then
-                writeAmmo(storedMax)
+            local now = tick()
+            if now - lastReloadTime > 0.3 then
+                -- Only reload if we're not already full
+                if ammo < maxHudAmmo then
+                    lastReloadTime = now
+                    pressReload()
+                end
             end
         end
 
-        -- Auto Reload: press R when low
+        -- AUTO RELOAD: press R when ammo below threshold
         if autoReloadEnabled then
             local now = tick()
-            if currentAmmo <= autoReloadThreshold and now - lastReloadTime > 1 then
+            if ammo <= autoReloadThreshold and now - lastReloadTime > 1 then
                 lastReloadTime = now
-                pcall(function()
-                    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.R, false, game)
-                    task.wait(0.05)
-                    VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.R, false, game)
-                end)
+                pressReload()
             end
         end
+
+        lastHudAmmo = ammo
     end
 end)
 
@@ -1166,17 +1079,17 @@ local AmmoGroup = Tabs.Combat:AddLeftGroupbox("Ammo")
 
 AmmoGroup:AddToggle("InfiniteAmmo", {
     Text = "Infinite Ammo", Default = false,
+    Tooltip = "Auto-reloads when ammo drops",
     Callback = function(v)
         infiniteAmmoEnabled = v
-        if not v then ammoPath = nil end
     end,
 })
 
 AmmoGroup:AddToggle("AutoReload", {
     Text = "Auto Reload", Default = false,
+    Tooltip = "Reloads when below threshold",
     Callback = function(v)
         autoReloadEnabled = v
-        if not v then ammoPath = nil end
     end,
 })
 
@@ -1185,12 +1098,10 @@ AmmoGroup:AddSlider("AutoReloadThreshold", {
     Callback = function(v) autoReloadThreshold = v end,
 })
 
-local AmmoInfoGroup = Tabs.Combat:AddRightGroupbox("Status")
-AmmoInfoGroup:AddButton("Refresh Ammo Path", function()
-    ammoPath = nil
-    print("[NullWave] Ammo path cache cleared")
-end)
-AmmoInfoGroup:AddLabel("Use Debug > Scan Ammo")
+local AmmoInfoGroup = Tabs.Combat:AddRightGroupbox("Info")
+AmmoInfoGroup:AddLabel("Ammo is server-side")
+AmmoInfoGroup:AddLabel("Infinite Ammo = auto-reload")
+AmmoInfoGroup:AddLabel("Works via HUD reading")
 
 -- =========================================================
 -- DEBUG TAB
@@ -1222,45 +1133,15 @@ DebugGroup:AddButton("Scan Buy Pads", function()
     end
 end)
 
-DebugGroup:AddButton("Scan Ammo on Tool", function()
-    local char = player.Character
-    if not char then return end
-    local tool = char:FindFirstChildWhichIsA("Tool")
-    if not tool then
-        print("[SCAN] No tool equipped — equip a gun first")
-        return
-    end
-    print("========================================================")
-    print("[SCAN] Tool: " .. tool.Name)
-    print("[SCAN] ValueObjects inside tool:")
-    for _, d in ipairs(tool:GetDescendants()) do
-        if d:IsA("IntValue") or d:IsA("NumberValue") or d:IsA("StringValue") then
-            print("  " .. d.ClassName .. ": " .. d.Name .. " = " .. tostring(d.Value))
-        end
-    end
-    print("[SCAN] Attributes on tool:")
-    for _, attrName in ipairs(tool:GetAttributes()) do
-        print("  " .. attrName .. " = " .. tostring(tool:GetAttribute(attrName)))
-    end
-    print("[SCAN] Attributes on character:")
-    for _, attrName in ipairs(char:GetAttributes()) do
-        print("  " .. attrName .. " = " .. tostring(char:GetAttribute(attrName)))
-    end
-    print("[SCAN] PlayerGui TextLabels with numbers (potential HUD):")
-    local pg = player:FindFirstChild("PlayerGui")
-    if pg then
-        local count = 0
-        for _, obj in ipairs(pg:GetDescendants()) do
-            if obj:IsA("TextLabel") and obj.Text and obj.Text:match("^%d+$") then
-                count = count + 1
-                if count <= 20 then
-                    print("  " .. obj:GetFullName() .. " = '" .. obj.Text .. "'")
-                end
-            end
-        end
-        print("  Total numeric labels: " .. count)
-    end
-    print("========================================================")
+DebugGroup:AddButton("Test Read HUD Ammo", function()
+    local ammo = readHudAmmo()
+    print("[TEST] HUD Ammo = " .. tostring(ammo))
+    print("[TEST] Max seen = " .. maxHudAmmo)
+end)
+
+DebugGroup:AddButton("Test Reload (R key)", function()
+    pressReload()
+    print("[TEST] Pressed R")
 end)
 
 DebugGroup:AddButton("Test Nearest Buy Pad", function()
