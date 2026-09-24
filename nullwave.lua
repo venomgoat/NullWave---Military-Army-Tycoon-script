@@ -619,52 +619,34 @@ RunService.Stepped:Connect(function()
 end)
 
 -- =========================================================
--- RELOAD ANIMATION SPEEDUP (THE REAL FIX)
+-- RELOAD ANIMATION SPEEDUP (poll-based, no metamethod hook)
 -- =========================================================
--- Hook AnimationTrack to speed up any "reload" animation
-local function installReloadAnimHook()
-    local mt = getrawmetatable(game)
-    if not mt then
-        print("[NullWave] getrawmetatable failed — cannot speed up reload")
-        return false
-    end
-    local oldNamecall = mt.__namecall
-    if not oldNamecall then return false end
+task.spawn(function()
+    while not destroyed do
+        task.wait(0.1)
+        if not instantReloadEnabled and not autoReloadEnabled then continue end
 
-    pcall(function() setreadonly(mt, false) end)
+        local hum = getHumanoid()
+        if not hum then continue end
+        local animator = hum:FindFirstChildOfClass("Animator")
+        if not animator then continue end
 
-    mt.__namecall = newcclosure(function(self, ...)
-        local method = getnamecallmethod()
-
-        -- Intercept AnimationTrack:Play() to speed up reload anims
-        if method == "Play" and typeof(self) == "Instance" and self:IsA("AnimationTrack") then
-            if instantReloadEnabled or autoReloadEnabled then
-                local animName = ""
-                local anim = self.Animation
+        pcall(function()
+            for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+                local anim = track.Animation
                 if anim then
-                    pcall(function() animName = anim.Name or "" end)
-                end
-                if animName:lower():find("reload") then
-                    task.spawn(function()
-                        task.wait(0.02)
-                        pcall(function() self:AdjustSpeed(reloadAnimSpeed) end)
-                    end)
+                    local n = (anim.Name or ""):lower()
+                    if n:find("reload") then
+                        pcall(function() track:AdjustSpeed(reloadAnimSpeed) end)
+                    end
                 end
             end
-        end
-
-        return oldNamecall(self, ...)
-    end)
-
-    pcall(function() setreadonly(mt, true) end)
-    print("[NullWave] Reload animation hook installed")
-    return true
-end
-
-installReloadAnimHook()
+        end)
+    end
+end)
 
 -- =========================================================
--- INSTANT RELOAD (press R when low — animation will be fast)
+-- INSTANT RELOAD
 -- =========================================================
 task.spawn(function()
     while not destroyed do
@@ -685,9 +667,7 @@ task.spawn(function()
         if not maxAmmoPerTool[toolName] or ammo > maxAmmoPerTool[toolName] then
             maxAmmoPerTool[toolName] = ammo
         end
-        local maxAmmo = maxAmmoPerTool[toolName]
 
-        -- Only press R when ammo is empty
         if ammo <= 0 and now - lastReloadTime > 0.5 then
             lastReloadTime = now
             pressReload()
@@ -970,12 +950,12 @@ end
 -- SPY
 -- =========================================================
 local spyEnabled = false
-local origNamecall2
+local origNamecall
 
 local function startSpy()
     if spyEnabled then return end
     spyEnabled = true
-    origNamecall2 = hookmetamethod(game, "__namecall", function(self, ...)
+    origNamecall = hookmetamethod(game, "__namecall", function(self, ...)
         local method = getnamecallmethod()
         if method == "FireServer" and (self == UpgradeBarrackRemote
             or self == ChooseBarrackRemote or self == BuyChosenBarrackRm) then
@@ -985,16 +965,16 @@ local function startSpy()
                 print("   [" .. i .. "] " .. typeof(a) .. " = " .. tostring(a))
             end
         end
-        return origNamecall2(self, ...)
+        return origNamecall(self, ...)
     end)
 end
 
 local function stopSpy()
     if not spyEnabled then return end
     spyEnabled = false
-    if origNamecall2 then
-        pcall(function() hookmetamethod(game, "__namecall", origNamecall2) end)
-        origNamecall2 = nil
+    if origNamecall then
+        pcall(function() hookmetamethod(game, "__namecall", origNamecall) end)
+        origNamecall = nil
     end
 end
 
@@ -1147,7 +1127,7 @@ local AmmoGroup = Tabs.Combat:AddLeftGroupbox("Ammo")
 
 AmmoGroup:AddToggle("InstantReload", {
     Text = "⚡ Instant Reload", Default = false,
-    Tooltip = "Speeds up reload animation 20x. Press R when mag empty",
+    Tooltip = "Speeds up reload animation. Press R when mag empty",
     Callback = function(v)
         instantReloadEnabled = v
         if not v then forceReleaseR() end
