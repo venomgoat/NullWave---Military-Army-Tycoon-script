@@ -140,8 +140,11 @@ local infiniteAmmoEnabled = false
 local autoReloadEnabled   = false
 local autoReloadThreshold = 10
 local lastReloadTime      = 0
-local lastHudAmmo         = nil
-local maxHudAmmo          = 30  -- default fallback
+local lastAmmoValue       = nil
+local lastAmmoChangeTime  = 0
+
+-- Max ammo PER TOOL (fix for 30 vs 50 bug)
+local maxAmmoPerTool = {}
 
 -- =========================================================
 -- TROOPS
@@ -197,13 +200,12 @@ local function getMainUi()
     return pg:FindFirstChild("MainUi")
 end
 
--- Read ammo from HUD (confirmed path)
 local function readHudAmmo()
     local mainUi = getMainUi()
     if not mainUi then return nil end
-    local hud = mainUi:FindFirstChild("Ui")
-    if not hud then return nil end
-    hud = hud:FindFirstChild("Hud")
+    local ui = mainUi:FindFirstChild("Ui")
+    if not ui then return nil end
+    local hud = ui:FindFirstChild("Hud")
     if not hud then return nil end
     local gunStats = hud:FindFirstChild("GunStatsFrame")
     if not gunStats then return nil end
@@ -522,12 +524,31 @@ local function findGreenUpgradeButton()
 end
 
 -- =========================================================
--- RELOAD KEY
+-- RELOAD KEY — safe press + force release
 -- =========================================================
+local R_KEY_CODE = 0x52  -- hex for R key
+
 local function pressReload()
     pcall(function()
-        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.R, false, game)
-        task.wait(0.05)
+        if keypress and keyrelease then
+            keypress(R_KEY_CODE)
+            task.wait(0.05)
+            keyrelease(R_KEY_CODE)
+        else
+            VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.R, false, game)
+            task.wait(0.05)
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.R, false, game)
+        end
+    end)
+end
+
+local function forceReleaseR()
+    pcall(function()
+        if keyrelease then
+            keyrelease(R_KEY_CODE)
+        end
+    end)
+    pcall(function()
         VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.R, false, game)
     end)
 end
@@ -600,54 +621,65 @@ RunService.Stepped:Connect(function()
 end)
 
 -- =========================================================
--- INFINITE AMMO + AUTO RELOAD (via HUD reading)
+-- INFINITE AMMO + AUTO RELOAD (fixed)
 -- =========================================================
 task.spawn(function()
     while not destroyed do
         task.wait(0.05)
         if not infiniteAmmoEnabled and not autoReloadEnabled then
-            lastHudAmmo = nil
+            lastAmmoValue = nil
             continue
         end
 
         local char = player.Character
-        if not char then continue end
+        if not char then
+            lastAmmoValue = nil
+            continue
+        end
         local tool = char:FindFirstChildWhichIsA("Tool")
         if not tool then
-            lastHudAmmo = nil
+            lastAmmoValue = nil
             continue
         end
 
         local ammo = readHudAmmo()
         if ammo == nil then continue end
 
-        -- Track max ammo
-        if ammo > maxHudAmmo then
-            maxHudAmmo = ammo
-        end
+        local now = tick()
+        local toolName = tool.Name
 
-        -- INFINITE AMMO: press R every 0.3s unconditionally while shooting
+        -- Track max ammo PER TOOL
+        if not maxAmmoPerTool[toolName] or ammo > maxAmmoPerTool[toolName] then
+            maxAmmoPerTool[toolName] = ammo
+        end
+        local maxAmmo = maxAmmoPerTool[toolName]
+
+        -- Track ammo changes to detect shooting
+        if lastAmmoValue ~= nil and ammo < lastAmmoValue then
+            -- User is shooting
+            lastAmmoChangeTime = now
+        end
+        lastAmmoValue = ammo
+
+        -- Time since user last shot
+        local timeSinceShot = now - lastAmmoChangeTime
+
+        -- INFINITE AMMO: only reload when user STOPPED shooting AND mag isn't full
         if infiniteAmmoEnabled then
-            local now = tick()
-            if now - lastReloadTime > 0.3 then
-                -- Only reload if we're not already full
-                if ammo < maxHudAmmo then
-                    lastReloadTime = now
-                    pressReload()
-                end
-            end
-        end
-
-        -- AUTO RELOAD: press R when ammo below threshold
-        if autoReloadEnabled then
-            local now = tick()
-            if ammo <= autoReloadThreshold and now - lastReloadTime > 1 then
+            -- Reload only if user hasn't shot for 0.4s (means they stopped firing)
+            if timeSinceShot > 0.4 and ammo < maxAmmo and now - lastReloadTime > 1 then
                 lastReloadTime = now
                 pressReload()
             end
         end
 
-        lastHudAmmo = ammo
+        -- AUTO RELOAD: press R when below threshold
+        if autoReloadEnabled then
+            if ammo <= autoReloadThreshold and now - lastReloadTime > 1 then
+                lastReloadTime = now
+                pressReload()
+            end
+        end
     end
 end)
 
@@ -1079,9 +1111,13 @@ local AmmoGroup = Tabs.Combat:AddLeftGroupbox("Ammo")
 
 AmmoGroup:AddToggle("InfiniteAmmo", {
     Text = "Infinite Ammo", Default = false,
-    Tooltip = "Auto-reloads when ammo drops",
+    Tooltip = "Auto-reloads when you STOP shooting",
     Callback = function(v)
         infiniteAmmoEnabled = v
+        if not v then
+            forceReleaseR()
+            lastAmmoValue = nil
+        end
     end,
 })
 
@@ -1090,6 +1126,10 @@ AmmoGroup:AddToggle("AutoReload", {
     Tooltip = "Reloads when below threshold",
     Callback = function(v)
         autoReloadEnabled = v
+        if not v then
+            forceReleaseR()
+            lastAmmoValue = nil
+        end
     end,
 })
 
@@ -1099,9 +1139,13 @@ AmmoGroup:AddSlider("AutoReloadThreshold", {
 })
 
 local AmmoInfoGroup = Tabs.Combat:AddRightGroupbox("Info")
-AmmoInfoGroup:AddLabel("Ammo is server-side")
 AmmoInfoGroup:AddLabel("Infinite Ammo = auto-reload")
-AmmoInfoGroup:AddLabel("Works via HUD reading")
+AmmoInfoGroup:AddLabel("Reloads only when you stop")
+AmmoInfoGroup:AddLabel("Reset max ammo:")
+AmmoInfoGroup:AddButton("Clear Max Ammo Cache", function()
+    maxAmmoPerTool = {}
+    print("[NullWave] Max ammo cache cleared")
+end)
 
 -- =========================================================
 -- DEBUG TAB
@@ -1135,13 +1179,22 @@ end)
 
 DebugGroup:AddButton("Test Read HUD Ammo", function()
     local ammo = readHudAmmo()
+    local char = player.Character
+    local tool = char and char:FindFirstChildWhichIsA("Tool")
+    local toolName = tool and tool.Name or "none"
+    print("[TEST] Tool: " .. toolName)
     print("[TEST] HUD Ammo = " .. tostring(ammo))
-    print("[TEST] Max seen = " .. maxHudAmmo)
+    print("[TEST] Cached max for this tool = " .. tostring(maxAmmoPerTool[toolName]))
 end)
 
 DebugGroup:AddButton("Test Reload (R key)", function()
     pressReload()
     print("[TEST] Pressed R")
+end)
+
+DebugGroup:AddButton("Force Release R Key", function()
+    forceReleaseR()
+    print("[TEST] R key released")
 end)
 
 DebugGroup:AddButton("Test Nearest Buy Pad", function()
@@ -1250,6 +1303,7 @@ KillGroup:AddButton("KILL SCRIPT", function()
     infiniteAmmoEnabled = false
     autoReloadEnabled = false
     stopSpy()
+    forceReleaseR()
     spaceWasDown = false
     speedValue = 16
     jumpPowerValue = 50
