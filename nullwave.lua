@@ -143,7 +143,7 @@ local lastReloadTime      = 0
 local lastAmmoValue       = nil
 local lastAmmoChangeTime  = 0
 
--- Max ammo PER TOOL (fix for 30 vs 50 bug)
+-- max ammo per tool
 local maxAmmoPerTool = {}
 
 -- =========================================================
@@ -526,17 +526,17 @@ end
 -- =========================================================
 -- RELOAD KEY — safe press + force release
 -- =========================================================
-local R_KEY_CODE = 0x52  -- hex for R key
+local R_KEY_CODE = 0x52
 
 local function pressReload()
     pcall(function()
         if keypress and keyrelease then
             keypress(R_KEY_CODE)
-            task.wait(0.05)
+            task.wait(0.03)
             keyrelease(R_KEY_CODE)
         else
             VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.R, false, game)
-            task.wait(0.05)
+            task.wait(0.03)
             VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.R, false, game)
         end
     end)
@@ -621,11 +621,11 @@ RunService.Stepped:Connect(function()
 end)
 
 -- =========================================================
--- INFINITE AMMO + AUTO RELOAD (fixed)
+-- INSTANT RELOAD (infinite ammo via aggressive R spam)
 -- =========================================================
 task.spawn(function()
     while not destroyed do
-        task.wait(0.05)
+        task.wait(0.02)  -- very fast poll
         if not infiniteAmmoEnabled and not autoReloadEnabled then
             lastAmmoValue = nil
             continue
@@ -648,38 +648,31 @@ task.spawn(function()
         local now = tick()
         local toolName = tool.Name
 
-        -- Track max ammo PER TOOL
+        -- Track max per tool
         if not maxAmmoPerTool[toolName] or ammo > maxAmmoPerTool[toolName] then
             maxAmmoPerTool[toolName] = ammo
         end
         local maxAmmo = maxAmmoPerTool[toolName]
 
-        -- Track ammo changes to detect shooting
-        if lastAmmoValue ~= nil and ammo < lastAmmoValue then
-            -- User is shooting
-            lastAmmoChangeTime = now
-        end
-        lastAmmoValue = ammo
-
-        -- Time since user last shot
-        local timeSinceShot = now - lastAmmoChangeTime
-
-        -- INFINITE AMMO: only reload when user STOPPED shooting AND mag isn't full
         if infiniteAmmoEnabled then
-            -- Reload only if user hasn't shot for 0.4s (means they stopped firing)
-            if timeSinceShot > 0.4 and ammo < maxAmmo and now - lastReloadTime > 1 then
-                lastReloadTime = now
-                pressReload()
+            -- INSTANT: as soon as ammo < max, fire R immediately
+            -- User can shoot nonstop because reload is virtually instant
+            if ammo < maxAmmo then
+                if now - lastReloadTime > 0.05 then
+                    lastReloadTime = now
+                    pressReload()
+                end
             end
         end
 
-        -- AUTO RELOAD: press R when below threshold
         if autoReloadEnabled then
             if ammo <= autoReloadThreshold and now - lastReloadTime > 1 then
                 lastReloadTime = now
                 pressReload()
             end
         end
+
+        lastAmmoValue = ammo
     end
 end)
 
@@ -931,7 +924,46 @@ local function rejoin()
 end
 
 -- =========================================================
--- SPY
+-- SHOT SPY — catches remote calls when shooting
+-- =========================================================
+local shotSpyEnabled = false
+local shotSpyOriginal
+
+local function startShotSpy()
+    if shotSpyEnabled then return end
+    shotSpyEnabled = true
+    shotSpyOriginal = hookmetamethod(game, "__namecall", function(self, ...)
+        local method = getnamecallmethod()
+        if method == "FireServer" and self:IsA("RemoteEvent") then
+            local args = {...}
+            -- Only log non-NullWave remotes
+            if not (self == UpgradeBarrackRemote or self == ChooseBarrackRemote
+                or self == BuyChosenBarrackRm or self == RebirthRemote) then
+                print("[SHOT SPY] " .. self:GetFullName() .. " (" .. #args .. " args)")
+                for i, a in ipairs(args) do
+                    local preview = tostring(a)
+                    if #preview > 60 then preview = preview:sub(1, 60) .. "..." end
+                    print("   [" .. i .. "] " .. typeof(a) .. " = " .. preview)
+                end
+            end
+        end
+        return shotSpyOriginal(self, ...)
+    end)
+    print("[NullWave] Shot Spy ENABLED — click shoot once to log remote")
+end
+
+local function stopShotSpy()
+    if not shotSpyEnabled then return end
+    shotSpyEnabled = false
+    if shotSpyOriginal then
+        pcall(function() hookmetamethod(game, "__namecall", shotSpyOriginal) end)
+        shotSpyOriginal = nil
+    end
+    print("[NullWave] Shot Spy DISABLED")
+end
+
+-- =========================================================
+-- SPY (upgrade remotes)
 -- =========================================================
 local spyEnabled = false
 local origNamecall
@@ -1110,8 +1142,8 @@ StealGroup:AddSlider("StealCooldown", {
 local AmmoGroup = Tabs.Combat:AddLeftGroupbox("Ammo")
 
 AmmoGroup:AddToggle("InfiniteAmmo", {
-    Text = "Infinite Ammo", Default = false,
-    Tooltip = "Auto-reloads when you STOP shooting",
+    Text = "Instant Reload", Default = false,
+    Tooltip = "Presses R instantly when mag is not full — near-infinite fire rate",
     Callback = function(v)
         infiniteAmmoEnabled = v
         if not v then
@@ -1139,9 +1171,9 @@ AmmoGroup:AddSlider("AutoReloadThreshold", {
 })
 
 local AmmoInfoGroup = Tabs.Combat:AddRightGroupbox("Info")
-AmmoInfoGroup:AddLabel("Infinite Ammo = auto-reload")
-AmmoInfoGroup:AddLabel("Reloads only when you stop")
-AmmoInfoGroup:AddLabel("Reset max ammo:")
+AmmoInfoGroup:AddLabel("Instant Reload = spam R")
+AmmoInfoGroup:AddLabel("Ammo is server-side")
+AmmoInfoGroup:AddLabel("Real infinite = needs remote exploit")
 AmmoInfoGroup:AddButton("Clear Max Ammo Cache", function()
     maxAmmoPerTool = {}
     print("[NullWave] Max ammo cache cleared")
@@ -1184,7 +1216,7 @@ DebugGroup:AddButton("Test Read HUD Ammo", function()
     local toolName = tool and tool.Name or "none"
     print("[TEST] Tool: " .. toolName)
     print("[TEST] HUD Ammo = " .. tostring(ammo))
-    print("[TEST] Cached max for this tool = " .. tostring(maxAmmoPerTool[toolName]))
+    print("[TEST] Cached max = " .. tostring(maxAmmoPerTool[toolName]))
 end)
 
 DebugGroup:AddButton("Test Reload (R key)", function()
@@ -1208,7 +1240,20 @@ DebugGroup:AddButton("Test Nearest Buy Pad", function()
     touchPart(pads[1].part)
 end)
 
-local DebugGroup2 = Tabs.Debug:AddRightGroupbox("Remote Test")
+local DebugGroup2 = Tabs.Debug:AddRightGroupbox("Spy")
+DebugGroup2:AddToggle("Spy", {
+    Text = "Enable Upgrade Spy", Default = false,
+    Callback = function(v)
+        if v then startSpy() else stopSpy() end
+    end,
+})
+DebugGroup2:AddToggle("ShotSpy", {
+    Text = "Enable Shot Spy", Default = false,
+    Tooltip = "Logs ALL remotes when you shoot — send me output!",
+    Callback = function(v)
+        if v then startShotSpy() else stopShotSpy() end
+    end,
+})
 DebugGroup2:AddButton("Fire BOTH (RifleSquad)", function()
     if ChooseBarrackRemote then
         pcall(function() ChooseBarrackRemote:FireServer("RifleSquad") end)
@@ -1218,12 +1263,6 @@ DebugGroup2:AddButton("Fire BOTH (RifleSquad)", function()
         pcall(function() UpgradeBarrackRemote:FireServer("RifleSquad") end)
     end
 end)
-DebugGroup2:AddToggle("Spy", {
-    Text = "Enable Spy", Default = false,
-    Callback = function(v)
-        if v then startSpy() else stopSpy() end
-    end,
-})
 
 -- =========================================================
 -- MOVEMENT TAB
@@ -1303,6 +1342,7 @@ KillGroup:AddButton("KILL SCRIPT", function()
     infiniteAmmoEnabled = false
     autoReloadEnabled = false
     stopSpy()
+    stopShotSpy()
     forceReleaseR()
     spaceWasDown = false
     speedValue = 16
