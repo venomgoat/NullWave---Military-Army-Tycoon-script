@@ -137,11 +137,11 @@ local stealCooldown       = 120
 local lastStealTime       = 0
 
 local infiniteAmmoEnabled = false
+local rapidFireEnabled    = false
 local autoReloadEnabled   = false
 local autoReloadThreshold = 10
 local lastReloadTime      = 0
-local lastAmmoValue       = nil
-local lastAmmoChangeTime  = 0
+local rapidFireDelay      = 0.05
 
 local maxAmmoPerTool = {}
 
@@ -531,11 +531,11 @@ local function pressReload()
     pcall(function()
         if keypress and keyrelease then
             keypress(R_KEY_CODE)
-            task.wait(0.03)
+            task.wait(0.02)
             keyrelease(R_KEY_CODE)
         else
             VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.R, false, game)
-            task.wait(0.03)
+            task.wait(0.02)
             VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.R, false, game)
         end
     end)
@@ -620,26 +620,40 @@ RunService.Stepped:Connect(function()
 end)
 
 -- =========================================================
--- INSTANT RELOAD
+-- RAPID FIRE (spams Tool:Activate + R)
+-- =========================================================
+task.spawn(function()
+    while not destroyed do
+        task.wait(0.01)
+        if not rapidFireEnabled then continue end
+
+        local char = player.Character
+        if not char then continue end
+        local tool = char:FindFirstChildWhichIsA("Tool")
+        if not tool then continue end
+
+        local now = tick()
+        if now - lastReloadTime < rapidFireDelay then continue end
+        lastReloadTime = now
+
+        -- Fire + reload in same tick
+        pcall(function() tool:Activate() end)
+        pressReload()
+    end
+end)
+
+-- =========================================================
+-- INSTANT RELOAD (spams R when mag isn't full)
 -- =========================================================
 task.spawn(function()
     while not destroyed do
         task.wait(0.02)
-        if not infiniteAmmoEnabled and not autoReloadEnabled then
-            lastAmmoValue = nil
-            continue
-        end
+        if not infiniteAmmoEnabled and not autoReloadEnabled then continue end
 
         local char = player.Character
-        if not char then
-            lastAmmoValue = nil
-            continue
-        end
+        if not char then continue end
         local tool = char:FindFirstChildWhichIsA("Tool")
-        if not tool then
-            lastAmmoValue = nil
-            continue
-        end
+        if not tool then continue end
 
         local ammo = readHudAmmo()
         if ammo == nil then continue end
@@ -667,8 +681,6 @@ task.spawn(function()
                 pressReload()
             end
         end
-
-        lastAmmoValue = ammo
     end
 end)
 
@@ -1098,38 +1110,46 @@ StealGroup:AddSlider("StealCooldown", {
 -- =========================================================
 local AmmoGroup = Tabs.Combat:AddLeftGroupbox("Ammo")
 
+AmmoGroup:AddToggle("RapidFire", {
+    Text = "⚡ Rapid Fire", Default = false,
+    Tooltip = "Spams Tool:Activate + R together — interrupts reload, near-infinite fire",
+    Callback = function(v)
+        rapidFireEnabled = v
+        if not v then forceReleaseR() end
+    end,
+})
+
+AmmoGroup:AddSlider("RapidFireDelay", {
+    Text = "Rapid Fire delay", Default = 0.05, Min = 0.01, Max = 0.2, Rounding = 2, Suffix = "s",
+    Callback = function(v) rapidFireDelay = v end,
+})
+
 AmmoGroup:AddToggle("InfiniteAmmo", {
     Text = "Instant Reload", Default = false,
     Tooltip = "Spams R when mag isn't full",
     Callback = function(v)
         infiniteAmmoEnabled = v
-        if not v then
-            forceReleaseR()
-            lastAmmoValue = nil
-        end
+        if not v then forceReleaseR() end
     end,
 })
 
 AmmoGroup:AddToggle("AutoReload", {
     Text = "Auto Reload", Default = false,
-    Tooltip = "Reloads when below threshold",
     Callback = function(v)
         autoReloadEnabled = v
-        if not v then
-            forceReleaseR()
-            lastAmmoValue = nil
-        end
+        if not v then forceReleaseR() end
     end,
 })
 
 AmmoGroup:AddSlider("AutoReloadThreshold", {
-    Text = "Reload below", Default = 10, Min = 0, Max = 100, Rounding = 0, Suffix = "",
+    Text = "Auto Reload below", Default = 10, Min = 0, Max = 100, Rounding = 0, Suffix = "",
     Callback = function(v) autoReloadThreshold = v end,
 })
 
 local AmmoInfoGroup = Tabs.Combat:AddRightGroupbox("Info")
-AmmoInfoGroup:AddLabel("Ammo is server-side")
-AmmoInfoGroup:AddLabel("Check Debug scans for ammo")
+AmmoInfoGroup:AddLabel("⚡ Rapid Fire")
+AmmoInfoGroup:AddLabel("= near-infinite fire rate")
+AmmoInfoGroup:AddLabel("(spams Activate + R)")
 AmmoInfoGroup:AddButton("Clear Max Ammo Cache", function()
     maxAmmoPerTool = {}
     print("[NullWave] Max ammo cache cleared")
@@ -1139,6 +1159,38 @@ end)
 -- DEBUG TAB
 -- =========================================================
 local DebugGroup = Tabs.Debug:AddLeftGroupbox("Debug")
+
+DebugGroup:AddButton("Test Read HUD Ammo", function()
+    local ammo = readHudAmmo()
+    local char = player.Character
+    local tool = char and char:FindFirstChildWhichIsA("Tool")
+    local toolName = tool and tool.Name or "none"
+    print("[TEST] Tool: " .. toolName)
+    print("[TEST] HUD Ammo = " .. tostring(ammo))
+    print("[TEST] Cached max = " .. tostring(maxAmmoPerTool[toolName]))
+end)
+
+DebugGroup:AddButton("Test Reload (R key)", function()
+    pressReload()
+    print("[TEST] Pressed R")
+end)
+
+DebugGroup:AddButton("Test Tool:Activate()", function()
+    local char = player.Character
+    if not char then return end
+    local tool = char:FindFirstChildWhichIsA("Tool")
+    if not tool then
+        print("[TEST] No tool")
+        return
+    end
+    pcall(function() tool:Activate() end)
+    print("[TEST] Activated: " .. tool.Name)
+end)
+
+DebugGroup:AddButton("Force Release R Key", function()
+    forceReleaseR()
+    print("[TEST] R key released")
+end)
 
 DebugGroup:AddButton("Check Selected Troops", function()
     local sel = getSelectedTroops()
@@ -1163,116 +1215,6 @@ DebugGroup:AddButton("Scan Buy Pads", function()
     for _, pad in ipairs(pads) do
         print("  " .. pad.part:GetFullName() .. " | price: " .. pad.price)
     end
-end)
-
-DebugGroup:AddButton("Test Read HUD Ammo", function()
-    local ammo = readHudAmmo()
-    local char = player.Character
-    local tool = char and char:FindFirstChildWhichIsA("Tool")
-    local toolName = tool and tool.Name or "none"
-    print("[TEST] Tool: " .. toolName)
-    print("[TEST] HUD Ammo = " .. tostring(ammo))
-    print("[TEST] Cached max = " .. tostring(maxAmmoPerTool[toolName]))
-end)
-
-DebugGroup:AddButton("Test Reload (R key)", function()
-    pressReload()
-    print("[TEST] Pressed R")
-end)
-
-DebugGroup:AddButton("Force Release R Key", function()
-    forceReleaseR()
-    print("[TEST] R key released")
-end)
-
-DebugGroup:AddButton("Test Nearest Buy Pad", function()
-    local pads = findBuyPads()
-    if #pads == 0 then
-        print("[TEST] No pads")
-        return
-    end
-    table.sort(pads, function(a, b) return a.price < b.price end)
-    print("[TEST] Touching: " .. pads[1].part:GetFullName() .. " ($" .. pads[1].price .. ")")
-    touchPart(pads[1].part)
-end)
-
--- NEW AMMO SCAN BUTTONS
-DebugGroup:AddButton("Scan Tool Scripts (ammo)", function()
-    local char = player.Character
-    if not char then return end
-    local tool = char:FindFirstChildWhichIsA("Tool")
-    if not tool then
-        print("[SCAN] No tool equipped")
-        return
-    end
-    print("========================================================")
-    print("[SCAN] Tool: " .. tool.Name)
-    print("[SCAN] Looking for scripts that mention 'ammo':")
-    for _, d in ipairs(tool:GetDescendants()) do
-        if d:IsA("Script") or d:IsA("LocalScript") or d:IsA("ModuleScript") then
-            local src = ""
-            pcall(function() src = d.Source end)
-            if src and src ~= "" then
-                print("  Found script: " .. d:GetFullName() .. " (" .. #src .. " chars)")
-                local found = false
-                for line in src:gmatch("[^\n]+") do
-                    if line:lower():find("ammo") or line:lower():find("clip")
-                       or line:lower():find("mag") or line:lower():find("reload") then
-                        print("    > " .. line:sub(1, 120))
-                        found = true
-                    end
-                end
-                if not found then
-                    print("    (no ammo-related lines)")
-                end
-            else
-                print("  " .. d.ClassName .. ": " .. d.Name .. " (source locked)")
-            end
-        end
-    end
-    print("========================================================")
-end)
-
-DebugGroup:AddButton("Scan ReplicatedStorage for Ammo", function()
-    print("========================================================")
-    print("[SCAN] ReplicatedStorage objects with ammo-related names:")
-    local found = 0
-    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
-        local n = obj.Name:lower()
-        if n:find("ammo") or n:find("clip") or n:find("mag")
-           or n:find("reload") or n:find("shoot") or n:find("fire")
-           or n:find("bullet") or n:find("gun") then
-            print("  " .. obj.ClassName .. ": " .. obj:GetFullName())
-            found = found + 1
-        end
-    end
-    print("  Total found: " .. found)
-    print("========================================================")
-end)
-
-DebugGroup:AddButton("Scan PlayerScripts (ammo)", function()
-    print("========================================================")
-    print("[SCAN] Checking PlayerScripts for ammo references:")
-    local ps = player:FindFirstChild("PlayerScripts")
-    if not ps then
-        print("  No PlayerScripts")
-        return
-    end
-    for _, d in ipairs(ps:GetDescendants()) do
-        if d:IsA("LocalScript") then
-            local src = ""
-            pcall(function() src = d.Source end)
-            if src and src ~= "" then
-                for line in src:gmatch("[^\n]+") do
-                    if line:lower():find("ammo") or line:lower():find("clip")
-                       or line:lower():find("reload") then
-                        print("  " .. d.Name .. ": " .. line:sub(1, 100))
-                    end
-                end
-            end
-        end
-    end
-    print("========================================================")
 end)
 
 local DebugGroup2 = Tabs.Debug:AddRightGroupbox("Spy")
@@ -1368,6 +1310,7 @@ KillGroup:AddButton("KILL SCRIPT", function()
     autoRebirthEnabled = false
     autoStealEnabled = false
     infiniteAmmoEnabled = false
+    rapidFireEnabled = false
     autoReloadEnabled = false
     stopSpy()
     forceReleaseR()
@@ -1415,7 +1358,7 @@ KillGroup:AddButton("KILL SCRIPT", function()
             for _, flag in ipairs({
                 "InfJump", "Noclip", "AFKEnabled",
                 "AutoCollect", "AutoBuy", "AutoUpgrade", "AutoRebirth", "AutoSteal",
-                "InfiniteAmmo", "AutoReload"
+                "InfiniteAmmo", "AutoReload", "RapidFire"
             }) do
                 if Library.Toggles[flag] then
                     Library.Toggles[flag]:SetValue(false)
@@ -1423,15 +1366,9 @@ KillGroup:AddButton("KILL SCRIPT", function()
             end
         end
         if Library.Options then
-            if Library.Options.JumpPower then
-                Library.Options.JumpPower:SetValue(50)
-            end
-            if Library.Options.WalkSpeed then
-                Library.Options.WalkSpeed:SetValue(16)
-            end
-            if Library.Options.FOV then
-                Library.Options.FOV:SetValue(70)
-            end
+            if Library.Options.JumpPower then Library.Options.JumpPower:SetValue(50) end
+            if Library.Options.WalkSpeed then Library.Options.WalkSpeed:SetValue(16) end
+            if Library.Options.FOV then Library.Options.FOV:SetValue(70) end
         end
     end)
 
