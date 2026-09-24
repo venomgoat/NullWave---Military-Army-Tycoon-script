@@ -143,7 +143,6 @@ local lastReloadTime      = 0
 local lastAmmoValue       = nil
 local lastAmmoChangeTime  = 0
 
--- max ammo per tool
 local maxAmmoPerTool = {}
 
 -- =========================================================
@@ -524,7 +523,7 @@ local function findGreenUpgradeButton()
 end
 
 -- =========================================================
--- RELOAD KEY — safe press + force release
+-- RELOAD KEY
 -- =========================================================
 local R_KEY_CODE = 0x52
 
@@ -621,11 +620,11 @@ RunService.Stepped:Connect(function()
 end)
 
 -- =========================================================
--- INSTANT RELOAD (infinite ammo via aggressive R spam)
+-- INSTANT RELOAD
 -- =========================================================
 task.spawn(function()
     while not destroyed do
-        task.wait(0.02)  -- very fast poll
+        task.wait(0.02)
         if not infiniteAmmoEnabled and not autoReloadEnabled then
             lastAmmoValue = nil
             continue
@@ -648,15 +647,12 @@ task.spawn(function()
         local now = tick()
         local toolName = tool.Name
 
-        -- Track max per tool
         if not maxAmmoPerTool[toolName] or ammo > maxAmmoPerTool[toolName] then
             maxAmmoPerTool[toolName] = ammo
         end
         local maxAmmo = maxAmmoPerTool[toolName]
 
         if infiniteAmmoEnabled then
-            -- INSTANT: as soon as ammo < max, fire R immediately
-            -- User can shoot nonstop because reload is virtually instant
             if ammo < maxAmmo then
                 if now - lastReloadTime > 0.05 then
                     lastReloadTime = now
@@ -924,46 +920,7 @@ local function rejoin()
 end
 
 -- =========================================================
--- SHOT SPY — catches remote calls when shooting
--- =========================================================
-local shotSpyEnabled = false
-local shotSpyOriginal
-
-local function startShotSpy()
-    if shotSpyEnabled then return end
-    shotSpyEnabled = true
-    shotSpyOriginal = hookmetamethod(game, "__namecall", function(self, ...)
-        local method = getnamecallmethod()
-        if method == "FireServer" and self:IsA("RemoteEvent") then
-            local args = {...}
-            -- Only log non-NullWave remotes
-            if not (self == UpgradeBarrackRemote or self == ChooseBarrackRemote
-                or self == BuyChosenBarrackRm or self == RebirthRemote) then
-                print("[SHOT SPY] " .. self:GetFullName() .. " (" .. #args .. " args)")
-                for i, a in ipairs(args) do
-                    local preview = tostring(a)
-                    if #preview > 60 then preview = preview:sub(1, 60) .. "..." end
-                    print("   [" .. i .. "] " .. typeof(a) .. " = " .. preview)
-                end
-            end
-        end
-        return shotSpyOriginal(self, ...)
-    end)
-    print("[NullWave] Shot Spy ENABLED — click shoot once to log remote")
-end
-
-local function stopShotSpy()
-    if not shotSpyEnabled then return end
-    shotSpyEnabled = false
-    if shotSpyOriginal then
-        pcall(function() hookmetamethod(game, "__namecall", shotSpyOriginal) end)
-        shotSpyOriginal = nil
-    end
-    print("[NullWave] Shot Spy DISABLED")
-end
-
--- =========================================================
--- SPY (upgrade remotes)
+-- SPY
 -- =========================================================
 local spyEnabled = false
 local origNamecall
@@ -1143,7 +1100,7 @@ local AmmoGroup = Tabs.Combat:AddLeftGroupbox("Ammo")
 
 AmmoGroup:AddToggle("InfiniteAmmo", {
     Text = "Instant Reload", Default = false,
-    Tooltip = "Presses R instantly when mag is not full — near-infinite fire rate",
+    Tooltip = "Spams R when mag isn't full",
     Callback = function(v)
         infiniteAmmoEnabled = v
         if not v then
@@ -1171,9 +1128,8 @@ AmmoGroup:AddSlider("AutoReloadThreshold", {
 })
 
 local AmmoInfoGroup = Tabs.Combat:AddRightGroupbox("Info")
-AmmoInfoGroup:AddLabel("Instant Reload = spam R")
 AmmoInfoGroup:AddLabel("Ammo is server-side")
-AmmoInfoGroup:AddLabel("Real infinite = needs remote exploit")
+AmmoInfoGroup:AddLabel("Check Debug scans for ammo")
 AmmoInfoGroup:AddButton("Clear Max Ammo Cache", function()
     maxAmmoPerTool = {}
     print("[NullWave] Max ammo cache cleared")
@@ -1240,18 +1196,90 @@ DebugGroup:AddButton("Test Nearest Buy Pad", function()
     touchPart(pads[1].part)
 end)
 
+-- NEW AMMO SCAN BUTTONS
+DebugGroup:AddButton("Scan Tool Scripts (ammo)", function()
+    local char = player.Character
+    if not char then return end
+    local tool = char:FindFirstChildWhichIsA("Tool")
+    if not tool then
+        print("[SCAN] No tool equipped")
+        return
+    end
+    print("========================================================")
+    print("[SCAN] Tool: " .. tool.Name)
+    print("[SCAN] Looking for scripts that mention 'ammo':")
+    for _, d in ipairs(tool:GetDescendants()) do
+        if d:IsA("Script") or d:IsA("LocalScript") or d:IsA("ModuleScript") then
+            local src = ""
+            pcall(function() src = d.Source end)
+            if src and src ~= "" then
+                print("  Found script: " .. d:GetFullName() .. " (" .. #src .. " chars)")
+                local found = false
+                for line in src:gmatch("[^\n]+") do
+                    if line:lower():find("ammo") or line:lower():find("clip")
+                       or line:lower():find("mag") or line:lower():find("reload") then
+                        print("    > " .. line:sub(1, 120))
+                        found = true
+                    end
+                end
+                if not found then
+                    print("    (no ammo-related lines)")
+                end
+            else
+                print("  " .. d.ClassName .. ": " .. d.Name .. " (source locked)")
+            end
+        end
+    end
+    print("========================================================")
+end)
+
+DebugGroup:AddButton("Scan ReplicatedStorage for Ammo", function()
+    print("========================================================")
+    print("[SCAN] ReplicatedStorage objects with ammo-related names:")
+    local found = 0
+    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+        local n = obj.Name:lower()
+        if n:find("ammo") or n:find("clip") or n:find("mag")
+           or n:find("reload") or n:find("shoot") or n:find("fire")
+           or n:find("bullet") or n:find("gun") then
+            print("  " .. obj.ClassName .. ": " .. obj:GetFullName())
+            found = found + 1
+        end
+    end
+    print("  Total found: " .. found)
+    print("========================================================")
+end)
+
+DebugGroup:AddButton("Scan PlayerScripts (ammo)", function()
+    print("========================================================")
+    print("[SCAN] Checking PlayerScripts for ammo references:")
+    local ps = player:FindFirstChild("PlayerScripts")
+    if not ps then
+        print("  No PlayerScripts")
+        return
+    end
+    for _, d in ipairs(ps:GetDescendants()) do
+        if d:IsA("LocalScript") then
+            local src = ""
+            pcall(function() src = d.Source end)
+            if src and src ~= "" then
+                for line in src:gmatch("[^\n]+") do
+                    if line:lower():find("ammo") or line:lower():find("clip")
+                       or line:lower():find("reload") then
+                        print("  " .. d.Name .. ": " .. line:sub(1, 100))
+                    end
+                end
+            end
+        end
+    end
+    print("========================================================")
+end)
+
 local DebugGroup2 = Tabs.Debug:AddRightGroupbox("Spy")
 DebugGroup2:AddToggle("Spy", {
     Text = "Enable Upgrade Spy", Default = false,
     Callback = function(v)
         if v then startSpy() else stopSpy() end
-    end,
-})
-DebugGroup2:AddToggle("ShotSpy", {
-    Text = "Enable Shot Spy", Default = false,
-    Tooltip = "Logs ALL remotes when you shoot — send me output!",
-    Callback = function(v)
-        if v then startShotSpy() else stopShotSpy() end
     end,
 })
 DebugGroup2:AddButton("Fire BOTH (RifleSquad)", function()
@@ -1342,7 +1370,6 @@ KillGroup:AddButton("KILL SCRIPT", function()
     infiniteAmmoEnabled = false
     autoReloadEnabled = false
     stopSpy()
-    stopShotSpy()
     forceReleaseR()
     spaceWasDown = false
     speedValue = 16
