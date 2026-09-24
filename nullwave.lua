@@ -136,12 +136,11 @@ local autoStealEnabled    = false
 local stealCooldown       = 120
 local lastStealTime       = 0
 
-local infiniteAmmoEnabled = false
-local rapidFireEnabled    = false
-local autoReloadEnabled   = false
-local autoReloadThreshold = 10
-local lastReloadTime      = 0
-local rapidFireDelay      = 0.05
+local instantReloadEnabled = false
+local autoReloadEnabled    = false
+local autoReloadThreshold  = 10
+local lastReloadTime       = 0
+local reloadAnimSpeed      = 20
 
 local maxAmmoPerTool = {}
 
@@ -620,35 +619,57 @@ RunService.Stepped:Connect(function()
 end)
 
 -- =========================================================
--- RAPID FIRE (spams Tool:Activate + R)
+-- RELOAD ANIMATION SPEEDUP (THE REAL FIX)
 -- =========================================================
-task.spawn(function()
-    while not destroyed do
-        task.wait(0.01)
-        if not rapidFireEnabled then continue end
-
-        local char = player.Character
-        if not char then continue end
-        local tool = char:FindFirstChildWhichIsA("Tool")
-        if not tool then continue end
-
-        local now = tick()
-        if now - lastReloadTime < rapidFireDelay then continue end
-        lastReloadTime = now
-
-        -- Fire + reload in same tick
-        pcall(function() tool:Activate() end)
-        pressReload()
+-- Hook AnimationTrack to speed up any "reload" animation
+local function installReloadAnimHook()
+    local mt = getrawmetatable(game)
+    if not mt then
+        print("[NullWave] getrawmetatable failed — cannot speed up reload")
+        return false
     end
-end)
+    local oldNamecall = mt.__namecall
+    if not oldNamecall then return false end
+
+    pcall(function() setreadonly(mt, false) end)
+
+    mt.__namecall = newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+
+        -- Intercept AnimationTrack:Play() to speed up reload anims
+        if method == "Play" and typeof(self) == "Instance" and self:IsA("AnimationTrack") then
+            if instantReloadEnabled or autoReloadEnabled then
+                local animName = ""
+                local anim = self.Animation
+                if anim then
+                    pcall(function() animName = anim.Name or "" end)
+                end
+                if animName:lower():find("reload") then
+                    task.spawn(function()
+                        task.wait(0.02)
+                        pcall(function() self:AdjustSpeed(reloadAnimSpeed) end)
+                    end)
+                end
+            end
+        end
+
+        return oldNamecall(self, ...)
+    end)
+
+    pcall(function() setreadonly(mt, true) end)
+    print("[NullWave] Reload animation hook installed")
+    return true
+end
+
+installReloadAnimHook()
 
 -- =========================================================
--- INSTANT RELOAD (spams R when mag isn't full)
+-- INSTANT RELOAD (press R when low — animation will be fast)
 -- =========================================================
 task.spawn(function()
     while not destroyed do
-        task.wait(0.02)
-        if not infiniteAmmoEnabled and not autoReloadEnabled then continue end
+        task.wait(0.05)
+        if not instantReloadEnabled then continue end
 
         local char = player.Character
         if not char then continue end
@@ -666,20 +687,34 @@ task.spawn(function()
         end
         local maxAmmo = maxAmmoPerTool[toolName]
 
-        if infiniteAmmoEnabled then
-            if ammo < maxAmmo then
-                if now - lastReloadTime > 0.05 then
-                    lastReloadTime = now
-                    pressReload()
-                end
-            end
+        -- Only press R when ammo is empty
+        if ammo <= 0 and now - lastReloadTime > 0.5 then
+            lastReloadTime = now
+            pressReload()
         end
+    end
+end)
 
-        if autoReloadEnabled then
-            if ammo <= autoReloadThreshold and now - lastReloadTime > 1 then
-                lastReloadTime = now
-                pressReload()
-            end
+-- =========================================================
+-- AUTO RELOAD
+-- =========================================================
+task.spawn(function()
+    while not destroyed do
+        task.wait(0.1)
+        if not autoReloadEnabled then continue end
+
+        local char = player.Character
+        if not char then continue end
+        local tool = char:FindFirstChildWhichIsA("Tool")
+        if not tool then continue end
+
+        local ammo = readHudAmmo()
+        if ammo == nil then continue end
+
+        local now = tick()
+        if ammo <= autoReloadThreshold and now - lastReloadTime > 0.5 then
+            lastReloadTime = now
+            pressReload()
         end
     end
 end)
@@ -935,12 +970,12 @@ end
 -- SPY
 -- =========================================================
 local spyEnabled = false
-local origNamecall
+local origNamecall2
 
 local function startSpy()
     if spyEnabled then return end
     spyEnabled = true
-    origNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+    origNamecall2 = hookmetamethod(game, "__namecall", function(self, ...)
         local method = getnamecallmethod()
         if method == "FireServer" and (self == UpgradeBarrackRemote
             or self == ChooseBarrackRemote or self == BuyChosenBarrackRm) then
@@ -950,16 +985,16 @@ local function startSpy()
                 print("   [" .. i .. "] " .. typeof(a) .. " = " .. tostring(a))
             end
         end
-        return origNamecall(self, ...)
+        return origNamecall2(self, ...)
     end)
 end
 
 local function stopSpy()
     if not spyEnabled then return end
     spyEnabled = false
-    if origNamecall then
-        pcall(function() hookmetamethod(game, "__namecall", origNamecall) end)
-        origNamecall = nil
+    if origNamecall2 then
+        pcall(function() hookmetamethod(game, "__namecall", origNamecall2) end)
+        origNamecall2 = nil
     end
 end
 
@@ -1110,31 +1145,24 @@ StealGroup:AddSlider("StealCooldown", {
 -- =========================================================
 local AmmoGroup = Tabs.Combat:AddLeftGroupbox("Ammo")
 
-AmmoGroup:AddToggle("RapidFire", {
-    Text = "⚡ Rapid Fire", Default = false,
-    Tooltip = "Spams Tool:Activate + R together — interrupts reload, near-infinite fire",
+AmmoGroup:AddToggle("InstantReload", {
+    Text = "⚡ Instant Reload", Default = false,
+    Tooltip = "Speeds up reload animation 20x. Press R when mag empty",
     Callback = function(v)
-        rapidFireEnabled = v
+        instantReloadEnabled = v
         if not v then forceReleaseR() end
     end,
 })
 
-AmmoGroup:AddSlider("RapidFireDelay", {
-    Text = "Rapid Fire delay", Default = 0.05, Min = 0.01, Max = 0.2, Rounding = 2, Suffix = "s",
-    Callback = function(v) rapidFireDelay = v end,
-})
-
-AmmoGroup:AddToggle("InfiniteAmmo", {
-    Text = "Instant Reload", Default = false,
-    Tooltip = "Spams R when mag isn't full",
-    Callback = function(v)
-        infiniteAmmoEnabled = v
-        if not v then forceReleaseR() end
-    end,
+AmmoGroup:AddSlider("ReloadAnimSpeed", {
+    Text = "Reload animation speed",
+    Default = 20, Min = 2, Max = 50, Rounding = 0, Suffix = "x",
+    Callback = function(v) reloadAnimSpeed = v end,
 })
 
 AmmoGroup:AddToggle("AutoReload", {
     Text = "Auto Reload", Default = false,
+    Tooltip = "Auto-press R when below threshold",
     Callback = function(v)
         autoReloadEnabled = v
         if not v then forceReleaseR() end
@@ -1147,9 +1175,9 @@ AmmoGroup:AddSlider("AutoReloadThreshold", {
 })
 
 local AmmoInfoGroup = Tabs.Combat:AddRightGroupbox("Info")
-AmmoInfoGroup:AddLabel("⚡ Rapid Fire")
-AmmoInfoGroup:AddLabel("= near-infinite fire rate")
-AmmoInfoGroup:AddLabel("(spams Activate + R)")
+AmmoInfoGroup:AddLabel("⚡ Instant Reload")
+AmmoInfoGroup:AddLabel("Speeds up reload anim 20x")
+AmmoInfoGroup:AddLabel("2s → 0.1s reload")
 AmmoInfoGroup:AddButton("Clear Max Ammo Cache", function()
     maxAmmoPerTool = {}
     print("[NullWave] Max ammo cache cleared")
@@ -1175,21 +1203,27 @@ DebugGroup:AddButton("Test Reload (R key)", function()
     print("[TEST] Pressed R")
 end)
 
-DebugGroup:AddButton("Test Tool:Activate()", function()
-    local char = player.Character
-    if not char then return end
-    local tool = char:FindFirstChildWhichIsA("Tool")
-    if not tool then
-        print("[TEST] No tool")
-        return
-    end
-    pcall(function() tool:Activate() end)
-    print("[TEST] Activated: " .. tool.Name)
-end)
-
 DebugGroup:AddButton("Force Release R Key", function()
     forceReleaseR()
     print("[TEST] R key released")
+end)
+
+DebugGroup:AddButton("Check Playing Animations", function()
+    local hum = getHumanoid()
+    if not hum then return end
+    local animator = hum:FindFirstChildOfClass("Animator")
+    if not animator then
+        print("[TEST] No Animator")
+        return
+    end
+    print("========================================")
+    print("[TEST] Playing animations:")
+    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+        local anim = track.Animation
+        local n = anim and anim.Name or "unknown"
+        print("  Animation: " .. n .. " | Speed: " .. tostring(track.Speed))
+    end
+    print("========================================")
 end)
 
 DebugGroup:AddButton("Check Selected Troops", function()
@@ -1309,8 +1343,7 @@ KillGroup:AddButton("KILL SCRIPT", function()
     autoUpgradeEnabled = false
     autoRebirthEnabled = false
     autoStealEnabled = false
-    infiniteAmmoEnabled = false
-    rapidFireEnabled = false
+    instantReloadEnabled = false
     autoReloadEnabled = false
     stopSpy()
     forceReleaseR()
@@ -1358,7 +1391,7 @@ KillGroup:AddButton("KILL SCRIPT", function()
             for _, flag in ipairs({
                 "InfJump", "Noclip", "AFKEnabled",
                 "AutoCollect", "AutoBuy", "AutoUpgrade", "AutoRebirth", "AutoSteal",
-                "InfiniteAmmo", "AutoReload", "RapidFire"
+                "InstantReload", "AutoReload"
             }) do
                 if Library.Toggles[flag] then
                     Library.Toggles[flag]:SetValue(false)
