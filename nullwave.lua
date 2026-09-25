@@ -193,16 +193,16 @@ local aimbotMaxDist    = 1500
 local aimbotTeam       = true
 local aimbotWall       = false
 
--- Manual friendly keyword override
-local friendlyKeyword = ""
-
 -- TRIGGER BOT
-local triggerBotEnabled   = false
-local triggerBotDelay     = 100
-local triggerBotRange     = 500
-local triggerBotParts     = {"Head"}
-local triggerBotTeam      = true
-local triggerBotTolerance = 20
+local triggerBotEnabled     = false
+local triggerBotKey         = Enum.KeyCode.C
+local triggerBotMode        = "Toggle"
+local triggerBotDelay       = 100
+local triggerBotRange       = 500
+local triggerBotParts       = {"Head"}
+local triggerBotTeam        = true
+local triggerBotTolerance   = 20
+local triggerBotShootBoxes  = false
 local triggerBotAllParts = {
     "Head", "HumanoidRootPart", "UpperTorso", "Torso",
     "LeftUpperArm", "RightUpperArm", "LeftLowerArm", "RightLowerArm",
@@ -350,115 +350,6 @@ local function getRebirthInfo()
 end
 
 -- =========================================================
--- OWN-UNIT DETECTION
--- =========================================================
-local ownUnitCache = setmetatable({}, {__mode = "k"})
-
-local function modelOwnedByMe(model)
-    if not model then return false end
-
-    for _, attrName in ipairs({"Owner", "OwnerId", "UserId", "Player", "Creator", "PlayerId", "OwnerUserId"}) do
-        local ok, val = pcall(function() return model:GetAttribute(attrName) end)
-        if ok and val ~= nil then
-            if tostring(val) == tostring(player.UserId) or tostring(val) == player.Name then
-                return true
-            end
-        end
-    end
-
-    local hum = model:FindFirstChildOfClass("Humanoid")
-    if hum then
-        for _, attrName in ipairs({"Owner", "OwnerId", "UserId", "Player", "Creator", "PlayerId"}) do
-            local ok, val = pcall(function() return hum:GetAttribute(attrName) end)
-            if ok and val ~= nil then
-                if tostring(val) == tostring(player.UserId) or tostring(val) == player.Name then
-                    return true
-                end
-            end
-        end
-    end
-
-    for _, child in ipairs(model:GetDescendants()) do
-        if child:IsA("ObjectValue") then
-            if child.Value == player then return true end
-            if child.Value and child.Value:IsA("Model") and child.Value == player.Character then return true end
-        elseif child:IsA("StringValue") or child:IsA("IntValue") or child:IsA("NumberValue") then
-            local v = tostring(child.Value)
-            if v == tostring(player.UserId) or v == player.Name then return true end
-        end
-    end
-
-    local map = workspace:FindFirstChild("Map")
-    if map then
-        local tys = map:FindFirstChild("Tycoons")
-        if tys then
-            local myT = tys:FindFirstChild(tostring(player.UserId))
-            if myT and model:IsDescendantOf(myT) then return true end
-        end
-    end
-
-    local p = model.Parent
-    while p and p ~= workspace do
-        local n = p.Name
-        if n == tostring(player.UserId) or n == player.Name
-           or n == tostring(player.UserId) .. "'s" or n == player.Name .. "'s"
-           or n:find(tostring(player.UserId)) or n:find(player.Name) then
-            return true
-        end
-        p = p.Parent
-    end
-
-    local modelName = model.Name
-    if modelName:find(tostring(player.UserId))
-       or modelName:lower():find(player.Name:lower()) then
-        return true
-    end
-
-    local tags = CollectionService:GetTags(model)
-    for _, tag in ipairs(tags) do
-        if tag:find(tostring(player.UserId)) or tag:lower():find(player.Name:lower())
-           or tag:lower():find("own") then
-            return true
-        end
-    end
-
-    if hum then
-        local ok, team = pcall(function() return hum.Team end)
-        if ok and team and team == player.Team then
-            return true
-        end
-    end
-
-    return false
-end
-
-local function isOwnUnit(model)
-    local cached = ownUnitCache[model]
-    if cached ~= nil then return cached end
-
-    -- Manual keyword override (highest priority)
-    if friendlyKeyword ~= "" then
-        local kw = friendlyKeyword:lower()
-        if model.Name:lower():find(kw, 1, true) then
-            ownUnitCache[model] = true
-            return true
-        end
-        local p = model.Parent
-        while p and p ~= workspace do
-            if p.Name:lower():find(kw, 1, true) then
-                ownUnitCache[model] = true
-                return true
-            end
-            p = p.Parent
-        end
-    end
-
-    local result = modelOwnedByMe(model)
-    ownUnitCache[model] = result
-    return result
-end
-
--- =========================================================
 -- TARGET DETECTION
 -- =========================================================
 local candidateCache     = {}
@@ -487,46 +378,58 @@ local function gatherCandidates()
     return list
 end
 
--- Reject props — must be a real character rig
 local function isRealCharacterRig(model)
     if not model:FindFirstChild("HumanoidRootPart") then return false end
     if not model:FindFirstChild("Head") then return false end
     return true
 end
 
+-- =========================================================
+-- ENEMY-ONLY TARGETING
+-- =========================================================
 local function isHostile(model, teamCheck)
     if not model or model == player.Character then return false end
     local hum = model:FindFirstChildOfClass("Humanoid")
     if not hum or hum.Health <= 0 then return false end
 
-    -- Must be a real rig, not a prop with a fake Humanoid
     if not isRealCharacterRig(model) then return false end
 
-    -- Anything tagged "Unlockable" is a tycoon prop / decoration, never an enemy
     for _, t in ipairs(CollectionService:GetTags(model)) do
         if t == "Unlockable" then return false end
     end
 
-    -- PLAYER CHARACTERS: normal team logic
+    -- Player characters: always targeted
     local tp = Players:GetPlayerFromCharacter(model)
     if tp then
-        if teamCheck then
-            if tp.Team == player.Team then return false end
-            if not tp.Team or not player.Team then return false end
-        end
         return true
     end
 
-    -- NPCs: only hostile if the NAME contains "enemy" or "hostile" (substring).
-    -- Your own troops are named after weapons (M4A1EliteSoldier, BizonSoldier, etc.)
-    -- so they won't match. Enemy NPCs are always named like "AK-47Enemy".
+    -- NPCs: only target if the name contains "enemy" or "hostile".
+    -- Everything else (all troops, friends or foes) is ignored.
     local name = model.Name:lower()
-    local isEnemyName = name:find("enemy") ~= nil or name:find("hostile") ~= nil
-    if not isEnemyName then return false end
+    if name:find("enemy") ~= nil or name:find("hostile") ~= nil then
+        return true
+    end
 
-    if teamCheck and isOwnUnit(model) then return false end
+    return false
+end
 
-    return true
+local function isHealthEntityProp(model)
+    if not model then return false end
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return false end
+    for _, t in ipairs(CollectionService:GetTags(model)) do
+        if t == "HealthEntity" then return true end
+    end
+    return false
+end
+
+local function isTriggerTarget(model, teamCheck)
+    if isHostile(model, teamCheck) then return true end
+    if triggerBotShootBoxes and isHealthEntityProp(model) then
+        return true
+    end
+    return false
 end
 
 local function isVisible(model, part, wallCheck)
@@ -591,18 +494,30 @@ local function findTargetMulti(partNames, maxDist, teamCheck)
 
     for _, model in ipairs(gatherCandidates()) do
         if model ~= player.Character and model.Parent then
-            if isHostile(model, teamCheck) then
+            if isTriggerTarget(model, teamCheck) then
+                local candidates = {}
                 for _, partName in ipairs(partNames) do
                     local p = model:FindFirstChild(partName)
-                    if p then
-                        local dist = (p.Position - hrp.Position).Magnitude
-                        if dist <= maxDist then
-                            local sp, onScreen = cam:WorldToViewportPoint(p.Position)
-                            if onScreen and sp.Z > 0 then
-                                local sd = (Vector2.new(sp.X, sp.Y) - center).Magnitude
-                                if sd < bestScore then
-                                    best, bestScore = p, sd
-                                end
+                    if p and p:IsA("BasePart") then
+                        table.insert(candidates, p)
+                    end
+                end
+                if #candidates == 0 then
+                    for _, p in ipairs(model:GetDescendants()) do
+                        if p:IsA("BasePart") and p.Transparency < 0.9 and p.CanQuery then
+                            table.insert(candidates, p)
+                        end
+                    end
+                end
+
+                for _, p in ipairs(candidates) do
+                    local dist = (p.Position - hrp.Position).Magnitude
+                    if dist <= maxDist then
+                        local sp, onScreen = cam:WorldToViewportPoint(p.Position)
+                        if onScreen and sp.Z > 0 then
+                            local sd = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+                            if sd < bestScore then
+                                best, bestScore = p, sd
                             end
                         end
                     end
@@ -946,6 +861,37 @@ track(UserInputService.InputEnded:Connect(function(input, gp)
 end))
 
 -- =========================================================
+-- TRIGGER BOT KEYBIND
+-- =========================================================
+track(UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == triggerBotKey then
+        if triggerBotMode == "Toggle" then
+            triggerBotEnabled = not triggerBotEnabled
+        else
+            triggerBotEnabled = true
+        end
+        pcall(function()
+            if Library.Toggles and Library.Toggles.TriggerEnabled then
+                Library.Toggles.TriggerEnabled:SetValue(triggerBotEnabled)
+            end
+        end)
+    end
+end))
+
+track(UserInputService.InputEnded:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == triggerBotKey and triggerBotMode == "Hold" then
+        triggerBotEnabled = false
+        pcall(function()
+            if Library.Toggles and Library.Toggles.TriggerEnabled then
+                Library.Toggles.TriggerEnabled:SetValue(false)
+            end
+        end)
+    end
+end))
+
+-- =========================================================
 -- SPEED / JUMP / FOV
 -- =========================================================
 player.CharacterAdded:Connect(function(char)
@@ -1207,7 +1153,7 @@ local function getSelectedTroops()
 end
 
 -- =========================================================
--- AUTO UPGRADE  (pending new game system)
+-- AUTO UPGRADE
 -- =========================================================
 local function tryUpgradeRemote(arg)
     if ChooseBarrackRemote then pcall(function() ChooseBarrackRemote:FireServer(arg) end) end
@@ -1370,7 +1316,9 @@ local function serverHop()
 end
 
 local function rejoin()
-    pcall(function() TeleportService:Teleport(game.PlaceId, player) end)
+    pcall(function()
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, player)
+    end)
 end
 
 -- =========================================================
@@ -1579,16 +1527,8 @@ AimbotGroup:AddToggle("AimbotWall", {
 
 AimbotGroup:AddToggle("AimbotTeam", {
     Text = "Team Check", Default = true,
-    Tooltip = "Won't target your own troops or same-team players",
+    Tooltip = "Only targets enemies (named 'Enemy'). All troops — yours and other players' — are ignored.",
     Callback = function(v) aimbotTeam = v end,
-})
-
-AimbotGroup:AddInput("FriendlyKeyword", {
-    Text = "Friendly Keyword",
-    Default = "",
-    Placeholder = "name/folder that marks your troops",
-    Tooltip = "Anything whose name or ancestor folder contains this is ignored",
-    Callback = function(v) friendlyKeyword = v; ownUnitCache = setmetatable({}, {__mode="k"}) end,
 })
 
 -- FOV CIRCLE SETTINGS
@@ -1633,6 +1573,28 @@ TriggerGroup:AddToggle("TriggerEnabled", {
     Callback = function(v) triggerBotEnabled = v end,
 })
 
+TriggerGroup:AddDropdown("TriggerKey", {
+    Text = "Trigger Key",
+    Values = {"C", "V", "F", "E", "Q", "X", "Z", "LeftAlt", "RightAlt"},
+    Default = "C",
+    Multi = false,
+    Callback = function(v)
+        if type(v) == "table" then v = v[1] end
+        local map = {
+            C = Enum.KeyCode.C, V = Enum.KeyCode.V, F = Enum.KeyCode.F,
+            E = Enum.KeyCode.E, Q = Enum.KeyCode.Q, X = Enum.KeyCode.X,
+            Z = Enum.KeyCode.Z, LeftAlt = Enum.KeyCode.LeftAlt,
+            RightAlt = Enum.KeyCode.RightAlt,
+        }
+        triggerBotKey = map[v] or Enum.KeyCode.C
+    end,
+})
+
+TriggerGroup:AddDropdown("TriggerMode", {
+    Text = "Trigger Mode", Values = {"Toggle", "Hold"}, Default = "Toggle", Multi = false,
+    Callback = function(v) if type(v) == "table" then v = v[1] end; triggerBotMode = v end,
+})
+
 TriggerGroup:AddDropdown("TriggerParts", {
     Text = "Target Parts",
     Values = triggerBotAllParts,
@@ -1674,8 +1636,15 @@ TriggerGroup:AddSlider("TriggerTolerance", {
 
 TriggerGroup:AddToggle("TriggerTeam", {
     Text = "Team Check", Default = true,
-    Tooltip = "Won't fire at your own troops or same-team players",
+    Tooltip = "Only fires at enemies (named 'Enemy'). All troops — yours and other players' — are ignored.",
     Callback = function(v) triggerBotTeam = v end,
+})
+
+TriggerGroup:AddToggle("TriggerShootBoxes", {
+    Text = "Shoot Electric Boxes",
+    Default = false,
+    Tooltip = "Also fire at HealthEntity props like ElectricBox",
+    Callback = function(v) triggerBotShootBoxes = v end,
 })
 
 -- AMMO
@@ -1708,21 +1677,6 @@ DebugGroup:AddButton("Scan Hostiles", function()
     print("[TEST] Total hostile: " .. count)
 end)
 
-DebugGroup:AddButton("Scan Own Units", function()
-    local count = 0
-    for _, model in ipairs(workspace:GetDescendants()) do
-        if model:IsA("Model") and model ~= player.Character then
-            if isOwnUnit(model) then
-                count = count + 1
-                if count <= 15 then
-                    print("  OWN: " .. model:GetFullName())
-                end
-            end
-        end
-    end
-    print("[TEST] Total own units detected: " .. count)
-end)
-
 DebugGroup:AddButton("Dump ALL Humanoids (full)", function()
     print("=== ALL Humanoid Models in Workspace ===")
     local n = 0
@@ -1738,19 +1692,13 @@ DebugGroup:AddButton("Dump ALL Humanoids (full)", function()
             end
             local path = table.concat(chain, ".") .. "." .. m.Name
             local tags = table.concat(CollectionService:GetTags(m), ",")
-            local attrs = {}
-            for _, a in ipairs(m:GetAttributes()) do
-                local ok, v = pcall(function() return m:GetAttribute(a) end)
-                if ok then table.insert(attrs, a .. "=" .. tostring(v)) end
-            end
             local hrp = m:FindFirstChild("HumanoidRootPart")
             local posStr = hrp and string.format("(%.0f,%.0f,%.0f)",
                 hrp.Position.X, hrp.Position.Y, hrp.Position.Z) or "no HRP"
             print(string.format("[%d] %s", n, path))
             print(string.format("     HP=%d pos=%s tags={%s}", hum.Health, posStr, tags))
-            if #attrs > 0 then print("     attrs={" .. table.concat(attrs, ", ") .. "}") end
-            print(string.format("     isOwn=%s  isHostile=%s",
-                tostring(isOwnUnit(m)), tostring(isHostile(m, true))))
+            print(string.format("     isHostile=%s",
+                tostring(isHostile(m, true))))
         end
     end
     print(string.format("=== Total humanoids: %d ===", n))
@@ -1845,6 +1793,7 @@ KillGroup:AddButton("KILL SCRIPT", function()
     autoReloadEnabled = false
     aimbotEnabled = false
     triggerBotEnabled = false
+    triggerBotShootBoxes = false
     stopSpy()
     forceReleaseR()
     spaceWasDown = false
@@ -1864,7 +1813,8 @@ KillGroup:AddButton("KILL SCRIPT", function()
             for _, flag in ipairs({
                 "InfJump", "Noclip", "AFKEnabled", "AimbotTeam",
                 "AutoCollect", "AutoBuy", "AutoUpgrade", "AutoRebirth", "AutoSteal",
-                "AutoReload", "AimbotEnabled", "TriggerEnabled", "TriggerTeam", "Spy"
+                "AutoReload", "AimbotEnabled", "TriggerEnabled", "TriggerTeam",
+                "TriggerShootBoxes", "Spy"
             }) do
                 if Library.Toggles[flag] then Library.Toggles[flag]:SetValue(false) end
             end
